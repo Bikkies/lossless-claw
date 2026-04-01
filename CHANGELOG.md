@@ -1,5 +1,17 @@
 # @martian-engineering/lossless-claw
 
+## 0.6.0
+
+### Minor Changes
+
+- [#195](https://github.com/Martian-Engineering/lossless-claw/pull/195) [`8efd2e9`](https://github.com/Martian-Engineering/lossless-claw/commit/8efd2e98a0000edf90953ecbb5060cf9c56baad3) Thanks [@jalehman](https://github.com/jalehman)! - Add explicit `/new` and `/reset` lifecycle handling for OpenClaw sessions.
+
+  `/new` now prunes fresh context from the active conversation while preserving retained summaries by configured depth, and `/reset` now archives the current conversation before starting a fresh active conversation for the same stable session key.
+
+### Patch Changes
+
+- [#230](https://github.com/Martian-Engineering/lossless-claw/pull/230) [`ca51445`](https://github.com/Martian-Engineering/lossless-claw/commit/ca51445c52e4c1c102023f0336a9d7e29f78c226) Thanks [@liu51115](https://github.com/liu51115)! - Fix compaction auth circuit breaker handling so auth failures during multi-pass sweeps still trip the breaker, while failures for one resolved summarizer no longer block unrelated providers or sessions.
+
 ## 0.5.3
 
 ### Patch Changes
