@@ -1573,9 +1573,12 @@ const lcmPlugin = {
         sessionKey: ctx.sessionKey,
       });
     });
+    // Review rules injection is handled in engine.ts assemble() method,
+    // which fires for ALL sessions including subagents.
     api.on("before_prompt_build", () => ({
       prependSystemContext: LOSSLESS_RECALL_POLICY_PROMPT,
     }));
+
     api.on("session_end", async (event) => {
       const lifecycleEvent = event as SessionEndLifecycleEvent;
       await lcm.handleSessionEnd({

@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { closeSync, createReadStream, openSync, readSync, statSync } from "node:fs";
+import { closeSync, createReadStream, existsSync, openSync, readFileSync, readSync, statSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -1163,6 +1163,7 @@ export class LcmContextEngine implements ContextEngine {
   private readonly fts5Available: boolean;
   private readonly ignoreSessionPatterns: RegExp[];
   private readonly statelessSessionPatterns: RegExp[];
+  private readonly knownReviewSessions = new Set<string>();
   private sessionOperationQueues = new Map<
     string,
     { promise: Promise<void>; refCount: number }
@@ -1967,7 +1968,9 @@ export class LcmContextEngine implements ContextEngine {
     sessionFile: string;
     sessionKey?: string;
   }): Promise<BootstrapResult> {
+    console.error(`[lcm-trace] bootstrap CALLED sessionKey=${params.sessionKey ?? "(none)"} sessionId=${params.sessionId} sessionFile=${params.sessionFile}`);
     if (this.shouldIgnoreSession({ sessionId: params.sessionId, sessionKey: params.sessionKey })) {
+      console.error(`[lcm-trace] bootstrap BAILED via shouldIgnoreSession sessionKey=${params.sessionKey ?? "(none)"}`);
       return {
         bootstrapped: false,
         importedMessages: 0,
@@ -1975,6 +1978,7 @@ export class LcmContextEngine implements ContextEngine {
       };
     }
     if (this.isStatelessSession(params.sessionKey)) {
+      console.error(`[lcm-trace] bootstrap BAILED via isStatelessSession sessionKey=${params.sessionKey ?? "(none)"}`);
       return {
         bootstrapped: false,
         importedMessages: 0,
@@ -2560,10 +2564,13 @@ export class LcmContextEngine implements ContextEngine {
     message: AgentMessage;
     isHeartbeat?: boolean;
   }): Promise<IngestResult> {
+    console.error(`[lcm-trace] ingest CALLED sessionKey=${params.sessionKey ?? "(none)"} sessionId=${params.sessionId}`);
     if (this.shouldIgnoreSession({ sessionId: params.sessionId, sessionKey: params.sessionKey })) {
+      console.error(`[lcm-trace] ingest BAILED via shouldIgnoreSession sessionKey=${params.sessionKey ?? "(none)"}`);
       return { ingested: false };
     }
     if (this.isStatelessSession(params.sessionKey)) {
+      console.error(`[lcm-trace] ingest BAILED via isStatelessSession sessionKey=${params.sessionKey ?? "(none)"}`);
       return { ingested: false };
     }
     this.ensureMigrated();
@@ -2579,10 +2586,13 @@ export class LcmContextEngine implements ContextEngine {
     messages: AgentMessage[];
     isHeartbeat?: boolean;
   }): Promise<IngestBatchResult> {
+    console.error(`[lcm-trace] ingestBatch CALLED sessionKey=${params.sessionKey ?? "(none)"} sessionId=${params.sessionId} count=${params.messages.length}`);
     if (this.shouldIgnoreSession({ sessionId: params.sessionId, sessionKey: params.sessionKey })) {
+      console.error(`[lcm-trace] ingestBatch BAILED via shouldIgnoreSession sessionKey=${params.sessionKey ?? "(none)"}`);
       return { ingestedCount: 0 };
     }
     if (this.isStatelessSession(params.sessionKey)) {
+      console.error(`[lcm-trace] ingestBatch BAILED via isStatelessSession sessionKey=${params.sessionKey ?? "(none)"}`);
       return { ingestedCount: 0 };
     }
     this.ensureMigrated();
@@ -2623,10 +2633,13 @@ export class LcmContextEngine implements ContextEngine {
     /** Back-compat param name. */
     legacyCompactionParams?: Record<string, unknown>;
   }): Promise<void> {
+    console.error(`[lcm-trace] afterTurn CALLED sessionKey=${params.sessionKey ?? "(none)"} sessionId=${params.sessionId} newMsgs=${params.messages.length - params.prePromptMessageCount}`);
     if (this.shouldIgnoreSession({ sessionId: params.sessionId, sessionKey: params.sessionKey })) {
+      console.error(`[lcm-trace] afterTurn BAILED via shouldIgnoreSession sessionKey=${params.sessionKey ?? "(none)"}`);
       return;
     }
     if (this.isStatelessSession(params.sessionKey)) {
+      console.error(`[lcm-trace] afterTurn BAILED via isStatelessSession sessionKey=${params.sessionKey ?? "(none)"}`);
       return;
     }
     this.ensureMigrated();
@@ -2782,6 +2795,25 @@ export class LcmContextEngine implements ContextEngine {
       // raw context items and clearly trails the current live history, keep
       // the live path to avoid dropping prompt context.
       const hasSummaryItems = contextItems.some((item) => item.itemType === "summary");
+
+      // Detect PR review sessions early (before potential early return).
+      const sessionCacheKey = params.sessionKey ?? params.sessionId;
+      if (!this.knownReviewSessions.has(sessionCacheKey) && sessionCacheKey.includes(":subagent:")) {
+        for (const m of params.messages) {
+          if (m.role !== "user") continue;
+          const msgText = typeof m.content === "string"
+            ? m.content
+            : Array.isArray(m.content)
+              ? (m.content as Array<{ text?: string }>).map((b) => b.text ?? "").join("")
+              : "";
+          if (msgText.includes("[PR_REVIEW_SESSION]")) {
+            this.knownReviewSessions.add(sessionCacheKey);
+            console.info(`[lcm] Identified PR review session: ${sessionCacheKey}`);
+            break;
+          }
+        }
+      }
+
       if (!hasSummaryItems && contextItems.length < params.messages.length) {
         return {
           messages: params.messages,
@@ -2801,6 +2833,7 @@ export class LcmContextEngine implements ContextEngine {
         conversationId: conversation.conversationId,
         tokenBudget,
         freshTailCount: this.config.freshTailCount,
+        contextThreshold: this.config.contextThreshold,
         prompt: params.prompt,
       });
 
@@ -2813,11 +2846,34 @@ export class LcmContextEngine implements ContextEngine {
         };
       }
 
+      // If this is a known PR review session and compaction has occurred, inject review rules.
+      let extraSystemPrompt = assembled.systemPromptAddition ?? "";
+
+      if (hasSummaryItems && this.knownReviewSessions.has(sessionCacheKey)) {
+        try {
+          const rulesPath = join(
+            homedir(),
+            ".openclaw/workspace/skills/bitbucket-assistant",
+            "REVIEW-RULES.md",
+          );
+          const rulesContent = existsSync(rulesPath) ? readFileSync(rulesPath, "utf-8") : null;
+          if (rulesContent) {
+            extraSystemPrompt = (extraSystemPrompt ? extraSystemPrompt + "\n\n" : "") +
+              "[Post-compaction review rules]\n\n" + rulesContent +
+              "\n\nContext was compacted. Re-read your task file (review-task.md) and workflow.md. " +
+              "Do not tick files you haven't read. Use write (not edit) for workflow.md and coverage.md.";
+            console.info(`[lcm] Injecting review rules via assemble for session ${sessionCacheKey}`);
+          }
+        } catch (err) {
+          console.warn(`[lcm] Review rules injection failed: ${err}`);
+        }
+      }
+
       const result: AssembleResultWithSystemPrompt = {
         messages: assembled.messages,
         estimatedTokens: assembled.estimatedTokens,
-        ...(assembled.systemPromptAddition
-          ? { systemPromptAddition: assembled.systemPromptAddition }
+        ...(extraSystemPrompt
+          ? { systemPromptAddition: extraSystemPrompt }
           : {}),
       };
       return result;
@@ -3412,14 +3468,18 @@ export class LcmContextEngine implements ContextEngine {
     nextSessionId?: string;
     nextSessionKey?: string;
   }): Promise<void> {
+    console.error(`[lcm-trace] handleSessionEnd CALLED sessionKey=${params.sessionKey ?? "(none)"} sessionId=${params.sessionId} reason=${params.reason ?? "(none)"}`);
     const reason = params.reason?.trim();
     if (!reason || reason === "new" || reason === "unknown") {
+      console.error(`[lcm-trace] handleSessionEnd BAILED reason=${reason ?? "(empty)"}`);
       return;
     }
     if (this.shouldIgnoreSession({ sessionId: params.sessionId, sessionKey: params.sessionKey })) {
+      console.error(`[lcm-trace] handleSessionEnd BAILED via shouldIgnoreSession sessionKey=${params.sessionKey ?? "(none)"}`);
       return;
     }
     if (this.isStatelessSession(params.sessionKey ?? params.nextSessionKey)) {
+      console.error(`[lcm-trace] handleSessionEnd BAILED via isStatelessSession sessionKey=${params.sessionKey ?? "(none)"}`);
       return;
     }
 
