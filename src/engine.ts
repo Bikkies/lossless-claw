@@ -2846,8 +2846,9 @@ export class LcmContextEngine implements ContextEngine {
         };
       }
 
-      // If this is a known PR review session and compaction has occurred, inject review rules.
-      let extraSystemPrompt = assembled.systemPromptAddition ?? "";
+      // If this is a known PR review session and compaction has occurred,
+      // inject review rules as a user message so the model treats it as fresh input.
+      let assembledMessages = assembled.messages;
 
       if (hasSummaryItems && this.knownReviewSessions.has(sessionCacheKey)) {
         try {
@@ -2858,11 +2859,22 @@ export class LcmContextEngine implements ContextEngine {
           );
           const rulesContent = existsSync(rulesPath) ? readFileSync(rulesPath, "utf-8") : null;
           if (rulesContent) {
-            extraSystemPrompt = (extraSystemPrompt ? extraSystemPrompt + "\n\n" : "") +
-              "[Post-compaction review rules]\n\n" + rulesContent +
-              "\n\nContext was compacted. Re-read your task file (review-task.md) and workflow.md. " +
-              "Do not tick files you haven't read. Use write (not edit) for workflow.md and coverage.md.";
-            console.info(`[lcm] Injecting review rules via assemble for session ${sessionCacheKey}`);
+            const injectionMsg = {
+              role: "user" as const,
+              content: "[IMPORTANT - POST-COMPACTION REMINDER]\n\n" +
+                "Context was just compacted. You MUST re-read your task file (review-task.md) and " +
+                "workflow.md RIGHT NOW to find where you are and what step to do next.\n\n" +
+                rulesContent +
+                "\n\nDo not tick files you haven't actually read and investigated. " +
+                "Use write (not edit) for workflow.md and coverage.md. " +
+                "Re-read the task file NOW before doing anything else.",
+            } as AgentMessage;
+
+            // Insert the reminder just before the last message so it appears recent
+            assembledMessages = [...assembled.messages];
+            const insertIdx = Math.max(0, assembledMessages.length - 1);
+            assembledMessages.splice(insertIdx, 0, injectionMsg);
+            console.info(`[lcm] Injecting review rules as user message for session ${sessionCacheKey}`);
           }
         } catch (err) {
           console.warn(`[lcm] Review rules injection failed: ${err}`);
@@ -2870,10 +2882,10 @@ export class LcmContextEngine implements ContextEngine {
       }
 
       const result: AssembleResultWithSystemPrompt = {
-        messages: assembled.messages,
+        messages: assembledMessages,
         estimatedTokens: assembled.estimatedTokens,
-        ...(extraSystemPrompt
-          ? { systemPromptAddition: extraSystemPrompt }
+        ...(assembled.systemPromptAddition
+          ? { systemPromptAddition: assembled.systemPromptAddition }
           : {}),
       };
       return result;
